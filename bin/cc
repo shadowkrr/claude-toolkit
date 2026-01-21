@@ -1,0 +1,427 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ===== シグナルハンドリング =====
+JOURNAL_SAVED=0
+save_journal() {
+  [[ "$JOURNAL_SAVED" == "1" ]] && return 0
+  JOURNAL_SAVED=1
+
+  # RUN_DIR が設定されていない場合はスキップ
+  [[ -z "${RUN_DIR:-}" ]] && return 0
+  [[ -z "${RAW_LOG:-}" ]] && return 0
+
+  local exit_code="${1:-130}"  # デフォルトは SIGINT
+
+  python3 - "$DB" "$(printf "%s" "${TASK:-}" | head -c 800)" "$exit_code" "$(project_name 2>/dev/null || echo '')" "$(pwd)" "$RUN_DIR" <<'PY' 2>/dev/null || true
+import sys
+import sqlite3
+import uuid
+from datetime import datetime
+
+db_path = sys.argv[1]
+task = sys.argv[2]
+exit_code = sys.argv[3]
+project = sys.argv[4]
+cwd = sys.argv[5]
+run_dir = sys.argv[6]
+
+j_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+j_ts = datetime.now().isoformat()
+j_result = f"exit_code={exit_code}"
+
+conn = sqlite3.connect(db_path)
+cur = conn.cursor()
+cur.execute("""
+    INSERT OR REPLACE INTO journal(id, ts, project, cwd, task, result, raw_ref)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+""", (j_id, j_ts, project, cwd, task[:800], j_result, run_dir))
+conn.commit()
+conn.close()
+print(f"📝 Journal saved: {j_id}")
+PY
+}
+
+cleanup() {
+  save_journal "${EXIT_CODE:-130}"
+}
+trap cleanup EXIT
+
+# ===== 設定 =====
+CLAUDE_CMD="${CLAUDE_CMD:-claude}"  # ここをあなたのClaude Code CLI名に合わせる
+SYS_MD="$HOME/.claude/system/claude_code_memory.md"
+DB="$HOME/.claude/db/memos.sqlite"
+RUNS="$HOME/.claude/runs"
+
+MEMO_DAILY_CAP="${CC_MEMO_DAILY_CAP:-50}"     # 成功時Memoの1日上限
+MEMO_JUDGE="${CC_MEMO_JUDGE:-1}"             # 1=LLMジャッジ有効
+MEMO_RULE_GATE="${CC_MEMO_RULE_GATE:-1}"     # 1=ルールゲート有効
+
+
+TOPK="${CC_TOPK:-5}"
+LOG_TAIL="${CC_LOG_TAIL:-200}"
+MEMO_ON_SUCCESS="${CC_MEMO_ON_SUCCESS:-0}" # 1にすると成功時も保存
+ENABLE_GIT_DIFF="${CC_ENABLE_GIT_DIFF:-1}"
+MAX_FIELD_CHARS="${CC_MAX_FIELD_CHARS:-800}"
+
+# ===== 依存チェック =====
+command -v sqlite3 >/dev/null 2>&1 || { echo "sqlite3 not found" >&2; exit 1; }
+command -v python3 >/dev/null 2>&1 || { echo "python3 not found" >&2; exit 1; }
+[[ -f "$SYS_MD" ]] || { echo "missing: $SYS_MD" >&2; exit 1; }
+[[ -f "$DB" ]] || { echo "missing: $DB" >&2; exit 1; }
+
+# セッション選択メニュー表示
+show_session_menu() {
+  echo "セッションを選択してください:"
+  echo "  1) 新規セッション"
+  echo "  2) 既存セッションを継続"
+  echo -n "選択 [1/2]: "
+  read -r choice
+  case "$choice" in
+    2)
+      # 既存セッションを継続（Claude のセッションピッカーを使用）
+      exec "$CLAUDE_CMD" --resume
+      ;;
+    1|"")
+      # 新規セッション（タスク入力へ進む）
+      echo "タスクを入力してください (Ctrl+D で終了):"
+      TASK="$(cat)"
+      ;;
+    *)
+      echo "無効な選択です" >&2
+      exit 1
+      ;;
+  esac
+}
+
+# タスク入力: 引数 > ファイル(-f) > stdin > 対話入力
+if [[ "${1:-}" == "-f" && -n "${2:-}" ]]; then
+  # ファイルから読み込み
+  [[ -f "$2" ]] || { echo "File not found: $2" >&2; exit 2; }
+  TASK="$(cat "$2")"
+elif [[ -n "${*:-}" ]]; then
+  # コマンドライン引数から
+  TASK="$*"
+elif [[ ! -t 0 ]]; then
+  # stdin から（パイプ入力）
+  TASK="$(cat)"
+else
+  # 引数なし・対話モード: セッション選択メニューを表示
+  show_session_menu
+fi
+[[ -n "$TASK" ]] || { echo 'Usage: cc "task" | cc -f file | echo "task" | cc' >&2; exit 2; }
+
+mkdir -p "$RUNS"
+RUN_ID="$(date +%Y%m%d_%H%M%S)"
+RUN_DIR="$RUNS/$RUN_ID"
+mkdir -p "$RUN_DIR"
+RAW_LOG="$RUN_DIR/raw.log"
+RECALL_TXT="$RUN_DIR/recall.md"
+MEMO_JSON="$RUN_DIR/memo.json"
+
+project_name() {
+  if command -v git >/dev/null 2>&1 && git rev-parse --show-toplevel >/dev/null 2>&1; then
+    basename "$(git rev-parse --show-toplevel)"
+  else
+    echo ""
+  fi
+}
+
+strip_ansi() {
+  # Remove ANSI escape codes from stdin
+  sed -E 's/\x1b\[[0-9;]*[A-Za-z]//g; s/\x1b\][^\\]*\\//g; s/\x1b\[[?0-9;]*[hlm]//g'
+}
+
+mask_secrets() {
+  # stdin -> stdout (必要なら追加強化)
+  sed -E \
+    -e 's/(Authorization:)[[:space:]]*Bearer[[:space:]]+[A-Za-z0-9._-]+/\1 Bearer [REDACTED]/gI' \
+    -e 's/\b(ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}\b/[REDACTED_GITHUB_TOKEN]/g' \
+    -e 's/\bya29\.[A-Za-z0-9._-]+\b/[REDACTED_GOOGLE_TOKEN]/g' \
+    -e 's/\beyJ[A-Za-z0-9._-]+\b/[REDACTED_JWT]/g' \
+    -e 's/\bAKIA[0-9A-Z]{16}\b/[REDACTED_AWS_ACCESS_KEY]/g' \
+    -e 's/\bASIA[0-9A-Z]{16}\b/[REDACTED_AWS_ACCESS_KEY]/g'
+}
+
+truncate_field() {
+  python3 - <<'PY'
+import os,sys
+s=sys.stdin.read()
+n=int(os.environ.get("MAX_FIELD_CHARS","800"))
+sys.stdout.write(s[:n])
+PY
+}
+
+sql_escape() {
+  python3 - <<'PY'
+import sys
+s=sys.stdin.read().replace("'", "''")
+print(s, end="")
+PY
+}
+
+build_query_text() {
+  local task="$1"
+  {
+    echo "task: $task"
+    echo "cwd: $(pwd)"
+    echo "project: $(project_name)"
+    echo "log_tail:"
+    tail -n 50 "$RAW_LOG" 2>/dev/null | strip_ansi || true
+    if [[ "$ENABLE_GIT_DIFF" == "1" ]] && command -v git >/dev/null 2>&1 && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+      echo "git_diff_stat:"
+      git diff --stat 2>/dev/null | head -n 20 || true
+    fi
+  } | mask_secrets
+}
+
+recall_memos() {
+  local q
+  q="$(build_query_text "$TASK" | truncate_field)"
+
+  # 空・短すぎるクエリは検索しない
+  if [[ -z "$(echo "$q" | tr -d '[:space:]')" || "${#q}" -lt 3 ]]; then
+    return 0
+  fi
+
+  q="$(printf "%s" "$q" | sql_escape)"
+
+  sqlite3 "$DB" <<SQL
+.mode tabs
+.headers off
+SELECT m.id, m.project, m.tags, m.problem, m.fix, m.takeaway
+FROM memos_fts f
+JOIN memos m ON m.id = f.id
+WHERE memos_fts MATCH '$q'
+ORDER BY bm25(memos_fts) ASC
+LIMIT $TOPK;
+SQL
+}
+
+format_recall() {
+  local rows="$1"
+  {
+    echo "## Related memory (auto-recalled)"
+    echo
+    if [[ -z "$rows" ]]; then
+      echo "- (none)"
+      echo
+      return 0
+    fi
+    while IFS=$'\t' read -r id project tags problem fix takeaway; do
+      [[ -z "$id" ]] && continue
+      echo "- id: $id"
+      [[ -n "$project" ]] && echo "  project: $project"
+      [[ -n "$tags" ]] && echo "  tags: $tags"
+      [[ -n "$problem" ]] && echo "  problem: $problem"
+      [[ -n "$fix" ]] && echo "  fix: $fix"
+      [[ -n "$takeaway" ]] && echo "  takeaway: $takeaway"
+    done <<< "$rows"
+    echo
+  } > "$RECALL_TXT"
+}
+
+# ===== 1) recall =====
+ROWS="$(recall_memos || true)"
+format_recall "$ROWS"
+
+# ===== 2) build context =====
+CONTEXT="$(cat "$SYS_MD"; echo; cat "$RECALL_TXT")"
+echo "$CONTEXT" > "$RUN_DIR/context.txt"
+echo "## Current task" >> "$RUN_DIR/context.txt"
+echo "$TASK" >> "$RUN_DIR/context.txt"
+
+# ===== 3) run Claude Code (interactive mode) =====
+# --append-system-prompt でコンテキストを注入し、対話モードを維持
+set +e
+script -q "$RAW_LOG" "$CLAUDE_CMD" --append-system-prompt "$CONTEXT" "$TASK"
+EXIT_CODE=$?
+set -e
+
+# ===== Journal: always append (facts only) =====
+save_journal "$EXIT_CODE"
+
+memo_daily_count() {
+  sqlite3 "$DB" "SELECT COUNT(*) FROM memos WHERE ts >= datetime('now','start of day');"
+}
+
+rule_worthy() {
+  # raw.log と task から判定（雑に強いキーワードを拾う）
+  # 1=worthy 0=not
+  local txt
+  txt="$( (echo "$TASK"; tail -n 120 "$RAW_LOG" | strip_ansi) | tr -d '\r' | mask_secrets )"
+  echo "$txt" | grep -Eqi \
+    'チェックリスト|リスト|調べて|調査|一覧|手順|ステップ|再発防止|恒久|判断基準|落とし穴|注意点|原因|切り分け|root cause|checklist|runbook|playbook|decision|trade-?off|pitfall' \
+    && echo 1 || echo 0
+}
+
+llm_worthy_json() {
+  # JSONで { "worthy": true/false, "reason": "...", "tags": [...] } を返させる
+  # 失敗しても安全側（false）に倒す
+  local input
+  input="$(
+    {
+      echo "次の情報から、この内容を '長期メモ(Memo)' として保存すべきかを判定してください。"
+      echo "出力はJSONのみ。スキーマ: {\"worthy\":true|false,\"reason\":\"短文\",\"tags\":[\"...\"]}"
+      echo "基準: 再利用性が高い(判断基準/手順/チェックリスト/恒久対策/落とし穴)なら worthy=true。一般論/一時情報なら false。"
+      echo "機密は含めない。"
+      echo
+      echo "TASK:"
+      echo "$TASK"
+      echo
+      echo "EXIT_CODE: $EXIT_CODE"
+      echo
+      echo "LOG_TAIL:"
+      tail -n 160 "$RAW_LOG" | strip_ansi | mask_secrets
+    } | truncate_field
+  )"
+
+  printf "%s\n" "$input" | "$CLAUDE_CMD" 2>/dev/null || echo '{"worthy":false,"reason":"judge_failed","tags":[]}'
+}
+
+# ===== 4) memoize (auto, guarded) =====
+SHOULD_MEMO=0
+
+if [[ "$EXIT_CODE" -ne 0 ]]; then
+  SHOULD_MEMO=1
+else
+  # 成功時は上限とゲートで制御
+  CNT="$(memo_daily_count)"
+  if [[ "$CNT" -lt "$MEMO_DAILY_CAP" ]]; then
+    if [[ "$MEMO_RULE_GATE" == "1" ]] && [[ "$(rule_worthy)" == "1" ]]; then
+      SHOULD_MEMO=1
+    elif [[ "$MEMO_JUDGE" == "1" ]]; then
+      JUDGE_JSON="$(llm_worthy_json)"
+      # worthy 判定
+      if python3 - <<PY >/dev/null 2>&1
+import json,sys
+d=json.loads(sys.argv[1])
+assert isinstance(d.get("worthy"), bool)
+assert d["worthy"] in (True, False)
+PY
+      then
+        if python3 - <<PY
+import json,sys
+d=json.loads(sys.argv[1])
+print(1 if d.get("worthy") else 0)
+PY
+ "$JUDGE_JSON" | grep -q '^1$'; then
+          SHOULD_MEMO=1
+        fi
+      fi
+    fi
+  fi
+fi
+
+if [[ "$SHOULD_MEMO" == "1" ]]; then
+  # ===== Generate memo JSON using Claude =====
+  MEMO_PROMPT="$(cat <<'PROMPT'
+以下の情報から「次回の自分が確実に得をする学び」を1件だけJSONで出力してください。
+
+厳守事項:
+- 出力はJSONのみ（前後に説明文を付けない）
+- 各フィールドは1〜3文まで
+- 推測・憶測は禁止
+- 一時的・その場限りの情報は禁止
+- 機密情報・認証情報・トークンは必ず [REDACTED]
+- 再利用できない内容なら {"skip": true, "reason": "理由"} を出力
+
+JSON Schema:
+{
+  "id": "一意なID（timestamp推奨）",
+  "ts": "ISO8601",
+  "project": "任意（repo名など）",
+  "tags": ["技術要素", "原因", "カテゴリ"],
+  "problem": "何が起きたか（事実のみ）",
+  "fix": "何をしたら解決したか（確定事項のみ）",
+  "takeaway": "次回の判断基準・チェックポイント",
+  "context": "OS / 言語 / 実行環境（短文）"
+}
+
+PROMPT
+)"
+
+  MEMO_INPUT="$(
+    {
+      echo "$MEMO_PROMPT"
+      echo
+      echo "=== 入力情報 ==="
+      echo "TASK: $TASK"
+      echo "EXIT_CODE: $EXIT_CODE"
+      echo "PROJECT: $(project_name)"
+      echo "CWD: $(pwd)"
+      echo "OS: $(uname -s) $(uname -r)"
+      echo
+      echo "LOG_TAIL:"
+      tail -n 200 "$RAW_LOG" 2>/dev/null | strip_ansi | mask_secrets | truncate_field
+    }
+  )"
+
+  MEMO_RAW="$(printf "%s\n" "$MEMO_INPUT" | "$CLAUDE_CMD" -p 2>/dev/null || echo '{"skip":true,"reason":"generation_failed"}')"
+  echo "$MEMO_RAW" > "$MEMO_JSON"
+
+  # ===== Validate and insert memo =====
+  python3 - "$MEMO_RAW" "$DB" "$RUN_DIR" "$(project_name)" "$(pwd)" <<'PY'
+import json
+import sys
+import sqlite3
+from datetime import datetime
+
+raw = sys.argv[1]
+db_path = sys.argv[2]
+run_dir = sys.argv[3]
+project = sys.argv[4]
+cwd = sys.argv[5]
+
+# Extract JSON from response (handle markdown code blocks)
+json_str = raw.strip()
+if json_str.startswith("```"):
+    lines = json_str.split("\n")
+    json_str = "\n".join(lines[1:-1] if lines[-1].startswith("```") else lines[1:])
+
+try:
+    memo = json.loads(json_str)
+except json.JSONDecodeError:
+    print(f"Invalid JSON: {raw[:200]}", file=sys.stderr)
+    sys.exit(0)
+
+# Check if skipped
+if memo.get("skip"):
+    print(f"Memo skipped: {memo.get('reason', 'unknown')}", file=sys.stderr)
+    sys.exit(0)
+
+# Validate required fields
+required = ["problem", "fix", "takeaway"]
+if not all(memo.get(f) for f in required):
+    print(f"Missing required fields: {required}", file=sys.stderr)
+    sys.exit(0)
+
+# Generate ID and timestamp if not provided
+memo_id = memo.get("id") or datetime.now().strftime("%Y%m%d_%H%M%S")
+memo_ts = memo.get("ts") or datetime.now().isoformat()
+tags = ",".join(memo.get("tags", [])) if isinstance(memo.get("tags"), list) else memo.get("tags", "")
+
+# Insert into DB
+conn = sqlite3.connect(db_path)
+cur = conn.cursor()
+cur.execute("""
+    INSERT OR REPLACE INTO memos (id, ts, project, cwd, tags, problem, fix, takeaway, context, raw_ref)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+""", (
+    memo_id,
+    memo_ts,
+    memo.get("project") or project,
+    cwd,
+    tags,
+    memo.get("problem", ""),
+    memo.get("fix", ""),
+    memo.get("takeaway", ""),
+    memo.get("context", ""),
+    run_dir
+))
+conn.commit()
+conn.close()
+print(f"✅ Memo saved: {memo_id}")
+PY
+
+fi

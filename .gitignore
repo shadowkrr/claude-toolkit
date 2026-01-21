@@ -1,0 +1,29 @@
+# 個人データ
+memory/daily/*.md
+db/memos.sqlite
+db/memos.sqlite-*
+runs/
+history.jsonl
+*.log
+
+# Claude Code 生成ファイル
+projects/
+session-env/
+todos/
+statsig/
+stats-cache.json
+file-history/
+debug/
+plans/
+paste-cache/
+ide/
+cache/
+plugins/
+shell-snapshots/
+
+# 設定（個人設定を含む可能性）
+settings.json
+
+# OS
+.DS_Store
+.claude/
