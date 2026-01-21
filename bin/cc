@@ -7,7 +7,7 @@ SYS_MD="$HOME/.claude/system/claude_code_memory.md"
 DB="$HOME/.claude/db/memos.sqlite"
 RUNS="$HOME/.claude/runs"
 
-MEMO_DAILY_CAP="${CC_MEMO_DAILY_CAP:-50}"     # 成功時Memoの1日上限
+MEMO_DAILY_CAP="${CC_MEMO_DAILY_CAP:-999}"    # 成功時Memoの1日上限（実質無制限）
 MEMO_JUDGE="${CC_MEMO_JUDGE:-1}"             # 1=LLMジャッジ有効
 MEMO_RULE_GATE="${CC_MEMO_RULE_GATE:-1}"     # 1=ルールゲート有効
 
