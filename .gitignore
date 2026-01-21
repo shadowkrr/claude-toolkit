@@ -1,10 +1,20 @@
-# 個人データ
+# 個人データ（絶対に公開禁止）
 memory/daily/*.md
 db/memos.sqlite
 db/memos.sqlite-*
 runs/
 history.jsonl
 *.log
+
+# 機密情報（絶対に公開禁止）
+*.env
+.env*
+credentials*.json
+*secret*
+*token*
+*.pem
+*.key
+*.p12
 
 # Claude Code 生成ファイル
 projects/

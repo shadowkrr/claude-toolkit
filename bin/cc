@@ -1,52 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ===== シグナルハンドリング =====
-JOURNAL_SAVED=0
-save_journal() {
-  [[ "$JOURNAL_SAVED" == "1" ]] && return 0
-  JOURNAL_SAVED=1
-
-  # RUN_DIR が設定されていない場合はスキップ
-  [[ -z "${RUN_DIR:-}" ]] && return 0
-  [[ -z "${RAW_LOG:-}" ]] && return 0
-
-  local exit_code="${1:-130}"  # デフォルトは SIGINT
-
-  python3 - "$DB" "$(printf "%s" "${TASK:-}" | head -c 800)" "$exit_code" "$(project_name 2>/dev/null || echo '')" "$(pwd)" "$RUN_DIR" <<'PY' 2>/dev/null || true
-import sys
-import sqlite3
-import uuid
-from datetime import datetime
-
-db_path = sys.argv[1]
-task = sys.argv[2]
-exit_code = sys.argv[3]
-project = sys.argv[4]
-cwd = sys.argv[5]
-run_dir = sys.argv[6]
-
-j_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
-j_ts = datetime.now().isoformat()
-j_result = f"exit_code={exit_code}"
-
-conn = sqlite3.connect(db_path)
-cur = conn.cursor()
-cur.execute("""
-    INSERT OR REPLACE INTO journal(id, ts, project, cwd, task, result, raw_ref)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
-""", (j_id, j_ts, project, cwd, task[:800], j_result, run_dir))
-conn.commit()
-conn.close()
-print(f"📝 Journal saved: {j_id}")
-PY
-}
-
-cleanup() {
-  save_journal "${EXIT_CODE:-130}"
-}
-trap cleanup EXIT
-
 # ===== 設定 =====
 CLAUDE_CMD="${CLAUDE_CMD:-claude}"  # ここをあなたのClaude Code CLI名に合わせる
 SYS_MD="$HOME/.claude/system/claude_code_memory.md"
@@ -238,9 +192,6 @@ script -q "$RAW_LOG" "$CLAUDE_CMD" --append-system-prompt "$CONTEXT" "$TASK"
 EXIT_CODE=$?
 set -e
 
-# ===== Journal: always append (facts only) =====
-save_journal "$EXIT_CODE"
-
 memo_daily_count() {
   sqlite3 "$DB" "SELECT COUNT(*) FROM memos WHERE ts >= datetime('now','start of day');"
 }
@@ -257,14 +208,24 @@ rule_worthy() {
 
 llm_worthy_json() {
   # JSONで { "worthy": true/false, "reason": "...", "tags": [...] } を返させる
-  # 失敗しても安全側（false）に倒す
+  # 失敗しても安全側（true）に倒す（緩い基準）
   local input
   input="$(
     {
       echo "次の情報から、この内容を '長期メモ(Memo)' として保存すべきかを判定してください。"
       echo "出力はJSONのみ。スキーマ: {\"worthy\":true|false,\"reason\":\"短文\",\"tags\":[\"...\"]}"
-      echo "基準: 再利用性が高い(判断基準/手順/チェックリスト/恒久対策/落とし穴)なら worthy=true。一般論/一時情報なら false。"
-      echo "機密は含めない。"
+      echo
+      echo "worthy=true にする基準（緩め・迷ったら true）:"
+      echo "- 何か新しいことを学んだ/発見した"
+      echo "- エラーを解決した"
+      echo "- 設定やツールの使い方を確認した"
+      echo "- コードの書き方・パターンを試した"
+      echo "- 判断基準/手順/チェックリストがある"
+      echo
+      echo "worthy=false にする基準（明確に不要な場合のみ）:"
+      echo "- 単純な typo 修正のみ"
+      echo "- 会話だけで実作業なし"
+      echo "- 機密情報を含む"
       echo
       echo "TASK:"
       echo "$TASK"
@@ -276,7 +237,7 @@ llm_worthy_json() {
     } | truncate_field
   )"
 
-  printf "%s\n" "$input" | "$CLAUDE_CMD" 2>/dev/null || echo '{"worthy":false,"reason":"judge_failed","tags":[]}'
+  printf "%s\n" "$input" | "$CLAUDE_CMD" 2>/dev/null || echo '{"worthy":true,"reason":"judge_failed_default_save","tags":[]}'
 }
 
 # ===== 4) memoize (auto, guarded) =====
