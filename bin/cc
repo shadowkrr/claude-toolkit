@@ -188,7 +188,7 @@ echo "$TASK" >> "$RUN_DIR/context.txt"
 # ===== 3) run Claude Code (interactive mode) =====
 # --append-system-prompt でコンテキストを注入し、対話モードを維持
 set +e
-script -q "$RAW_LOG" "$CLAUDE_CMD" --append-system-prompt "$CONTEXT" "$TASK"
+script -q "$RAW_LOG" "$CLAUDE_CMD" --append-system-prompt "$CONTEXT" -- "$TASK"
 EXIT_CODE=$?
 set -e
 
