@@ -1,214 +1,87 @@
-# Claude Code External Memory System
+# Claude Code Toolkit
 
-Claude Code に外部永続メモリを追加し、過去の学びを自動的に蓄積・検索・再利用するシステム。
-
-## 概要
-
-Claude Code は継続学習（重み更新）ができないため、代替として外部メモリに「学び」を保存し、次回以降に検索・参照する仕組みを提供する。
+Claude Code の日報自動生成とセッション管理ツール。
 
 ## ディレクトリ構成
 
 ```
 ~/.claude/
-├── system/
-│   └── claude_code_memory.md   # システムプロンプト（メモリ運用ルール）
-├── db/
-│   └── memos.sqlite            # メモのデータベース
 ├── bin/
-│   ├── cc                      # Claude Code ラッパースクリプト
-│   └── daily-report.sh         # 日報生成スクリプト
+│   ├── cc                      # セッション選択ランチャー
+│   ├── daily-report.sh         # 日報生成（SessionEnd hook）
+│   └── daily-report-gen.py     # 日報生成ロジック
 ├── memory/
-│   ├── daily/                  # 日報ファイル（YYYY-MM-DD.md）
-│   └── logs/                   # 追加ログ
-├── runs/                       # 実行ログ（run_id ごと）
-├── settings.json               # Claude Code 設定
-└── README.md
+│   ├── daily/                  # 日報（YYYY-MM-DD.md）
+│   └── logs/                   # 日報生成ログ
+├── settings.json               # Claude Code 設定（hooks等）
+└── .gitignore
 ```
 
-## 使い方
-
-### 基本実行
+## cc - セッション選択ランチャー
 
 ```bash
-# コマンドライン引数
-cc "タスクの説明"
-
-# ファイルから
-cc -f task.txt
-
-# パイプ入力
-echo "タスクの説明" | cc
-
-# 対話モード
-cc
+cc              # セッション選択メニュー（新規 or 継続）
+cc "タスク"     # タスクを指定して起動
+cc -f task.md   # ファイルからタスクを読み込み
+echo "x" | cc   # パイプ入力
 ```
 
-### 動作フロー
+## 日報自動生成
 
-1. **Recall**: 過去のメモから関連情報を BM25 で検索
-2. **Inject**: 検索結果をシステムプロンプトに注入
-3. **Execute**: Claude Code を対話モードで実行
-4. **Memoize**: 条件を満たす場合にメモを保存（緩い基準）
+### データソース（ハイブリッド）
 
-## メモ保存ルール
-
-### 保存される条件
-
-- 失敗時（exit_code != 0）は自動保存
-- 成功時は以下のゲートを通過した場合:
-  - ルールゲート: キーワードマッチ（チェックリスト、原因、判断基準など）
-  - LLMジャッジ: 緩い基準で worthy=true と判定（迷ったら保存）
-
-### 良いメモの基準（緩め）
-
-- 何か新しいことを学んだ/発見した
-- エラーを解決した
-- 設定やツールの使い方を確認した
-- コードの書き方・パターンを試した
-
-### 保存禁止
-
-- APIキー / トークン / Cookie / JWT（機密情報）
-- 単純な typo 修正のみ
-- 会話だけで実作業なし
-- 1回の実行で複数メモ
-
-## 環境変数
-
-| 変数 | デフォルト | 説明 |
-|------|-----------|------|
-| `CLAUDE_CMD` | `claude` | Claude Code CLI のコマンド名 |
-| `CC_TOPK` | `5` | Recall 時の取得件数 |
-| `CC_LOG_TAIL` | `200` | メモ生成時に参照するログ行数 |
-| `CC_MEMO_DAILY_CAP` | `999` | 成功時メモの1日上限（実質無制限） |
-| `CC_MEMO_JUDGE` | `1` | LLMジャッジの有効/無効 |
-| `CC_MEMO_RULE_GATE` | `1` | ルールゲートの有効/無効 |
-| `CC_MEMO_ON_SUCCESS` | `0` | 成功時も常にメモ保存 |
-| `CC_ENABLE_GIT_DIFF` | `1` | git diff を検索クエリに含める |
-| `CC_MAX_FIELD_CHARS` | `800` | フィールドの最大文字数 |
-
-## 依存関係
-
-- `sqlite3`
-- `python3`
-- `claude` (Claude Code CLI)
-
-## データベーススキーマ
-
-### memos テーブル
-
-メモの本体。FTS5 インデックス付き。
-
-| カラム | 説明 |
+| ソース | 用途 |
 |--------|------|
-| id | 一意ID (timestamp) |
-| ts | ISO8601 タイムスタンプ |
-| project | リポジトリ名など |
-| tags | カンマ区切りのタグ |
-| problem | 何が起きたか |
-| fix | 何をしたら解決したか |
-| takeaway | 次回の判断基準 |
-| context | 環境情報 |
+| `history.jsonl` | タスク一覧（全セッション漏れなし） |
+| `projects/*/*.jsonl` | 変更詳細（Edit/Write の before/after） |
 
-## 日報機能（Daily Report）
-
-### 概要
-
-セッション終了時に、直前のセッション内容を Claude (haiku) で要約し、日報に追記する。非同期実行でセッション終了をブロックしない。
-
-### 出力先
-
-```
-~/.claude/memory/daily/YYYY-MM-DD.md
-```
-
-### 日報の形式
-
-セッションごとに以下の形式で追記される：
+### 出力形式
 
 ```markdown
-## [HH:MM] プロジェクト名
+# 2026-02-18 日報
 
-### 変更内容
-- **修正前**: (変更前の状態・コード)
-- **修正後**: (変更後の状態・コード)
+## タスク一覧
 
-### 概要
-(何を・なぜ変更したかの説明)
+| 時刻 | プロジェクト | 内容 |
+|------|-------------|------|
+| 09:15 | my-project | 認証バグを修正 |
+| 14:00 | my-app | APIエンドポイント追加 |
 
----
+## 変更詳細
+
+### my-project
+
+| ファイル | 変更前 | 変更後 |
+|---------|--------|--------|
+| auth.go | `if token == ""` | `if token == "" \|\| isExpired(token)` |
+
+**新規作成:**
+- `middleware.go`
 ```
-
-#### フィールド説明
-
-| フィールド | 説明 |
-|-----------|------|
-| `[HH:MM]` | セッション終了時刻（24時間形式） |
-| プロジェクト名 | 作業対象のリポジトリ/ディレクトリ名 |
-| 修正前 | 変更前の状態やコードの概要 |
-| 修正後 | 変更後の状態やコードの概要 |
-| 概要 | 変更の目的・理由・影響範囲 |
-
-#### 例
-
-```markdown
-# 2026-01-27 日報
-
-## [14:30] my-project - ログ出力改善
-
-### 変更内容
-- **修正前**: エラー時にスタックトレースのみ出力
-- **修正後**: エラー時にリクエストIDとユーザーコンテキストも出力
-
-### 概要
-障害調査の効率化のため、エラーログに追跡情報を追加。
-
----
-
-## [16:45] my-project
-
-### 変更内容
-- **修正前**: 設定ファイルがハードコードされていた
-- **修正後**: 環境変数から設定を読み込むように変更
-
-### 概要
-デプロイ環境ごとの設定切り替えを容易にするため、設定の外部化を実施。
-
----
-```
-
-### 処理フロー
-
-1. セッション終了時に SessionEnd hook が発火
-2. 直近60分以内の最新セッション（jsonl）を特定
-3. セッションから Edit/Write ツール使用とユーザー指示を抽出
-4. Claude (haiku) で要約を生成
-5. 日報ファイルに追記
 
 ### 自動実行
 
-`settings.json` の SessionEnd hook により、セッション終了時に非同期で実行される。
+SessionEnd hook でセッション終了時にバックグラウンド実行。
 
 ```json
 {
   "hooks": {
-    "SessionEnd": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "$HOME/.claude/bin/daily-report.sh"
-          }
-        ]
-      }
-    ]
+    "SessionEnd": [{
+      "hooks": [{
+        "type": "command",
+        "command": "$HOME/.claude/bin/daily-report.sh"
+      }]
+    }]
   }
 }
 ```
 
-手動実行: `~/.claude/bin/daily-report.sh`
+手動実行: `~/.claude/bin/daily-report.sh [YYYY-MM-DD]`
 
-ログ出力先: `~/.claude/memory/logs/daily-report-*.log`
+## 依存関係
+
+- `python3`
+- `claude` (Claude Code CLI)
 
 ## ライセンス
 
