@@ -28,36 +28,23 @@ echo "x" | cc   # パイプ入力
 
 ## 日報自動生成
 
-### データソース（ハイブリッド）
+### 仕組み（ハイブリッド v8）
+
+1. `history.jsonl` から対象日のプロジェクトパスを解決
+2. `projects/*/*.jsonl` からセッションの会話・変更を抽出
+3. プロジェクト単位で統合し、Claude haiku で要約
+4. Markdown 日報として `memory/daily/YYYY-MM-DD.md` に出力
 
 | ソース | 用途 |
 |--------|------|
-| `history.jsonl` | タスク一覧（全セッション漏れなし） |
-| `projects/*/*.jsonl` | 変更詳細（Edit/Write の before/after） |
+| `history.jsonl` | プロジェクトパス解決 |
+| `projects/*/*.jsonl` | 会話 + 変更詳細 |
 
-### 出力形式
+### 特徴
 
-```markdown
-# 2026-02-18 日報
-
-## タスク一覧
-
-| 時刻 | プロジェクト | 内容 |
-|------|-------------|------|
-| 09:15 | my-project | 認証バグを修正 |
-| 14:00 | my-app | APIエンドポイント追加 |
-
-## 変更詳細
-
-### my-project
-
-| ファイル | 変更前 | 変更後 |
-|---------|--------|--------|
-| auth.go | `if token == ""` | `if token == "" \|\| isExpired(token)` |
-
-**新規作成:**
-- `middleware.go`
-```
+- **多重起動防止**: ロックファイル（PIDベース）で排他制御
+- **ノイズ除外**: go-build, /var/folders 等の自動生成パスをフィルタ
+- **環境変数クリア**: SessionEnd hook 実行時のネスト検出を回避
 
 ### 自動実行
 
@@ -81,7 +68,7 @@ SessionEnd hook でセッション終了時にバックグラウンド実行。
 ## 依存関係
 
 - `python3`
-- `claude` (Claude Code CLI)
+- `claude` (Claude Code CLI / haiku で要約に使用)
 
 ## ライセンス
 
